@@ -1,18 +1,31 @@
 import streamlit as st
-import google.generativeai as genai
+from huggingface_hub import InferenceClient
 from PIL import Image
 import json
 import re
 import io
-import time
+import base64
 
 # ─── Page Config ────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear {
+    display: none;
+}
+
+[data-testid="stTextInput"] button {
+    display: none;
+}
+</style>
+""", unsafe_allow_html=True)
 st.set_page_config(
-    page_title="Product Caption Generator",
-    page_icon="",
+    page_title="I2C for E-commerce",
+    page_icon="🛍️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 # ─── Custom CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -143,105 +156,151 @@ st.markdown("""
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
-def configure_gemini(api_key: str):
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash")
+HF_MODEL = "Qwen/Qwen2.5-VL-72B-Instruct"
+
+def get_hf_client(token: str) -> InferenceClient:
+    return InferenceClient(token=token)
 
 
-SYSTEM_PROMPT = """
-You are an expert e-commerce product analyst and copywriter. Your job is to analyze product images
-and generate compelling, SEO-friendly product listings.
+def image_to_base64(image: Image.Image) -> str:
+    """Convert PIL Image to base64 data URL for HuggingFace API."""
+    buffered = io.BytesIO()
+    image.convert("RGB").save(buffered, format="JPEG", quality=85)
+    b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
-Given an image of a product, return ONLY a valid JSON object (no markdown, no backticks) with these keys:
+
+BASE_PROMPT = """
+You are an expert e-commerce product analyst and copywriter.
+
+Analyze the product image and return ONLY a valid JSON object.
+
+Use exactly these keys:
 
 {
-  "title": "Short, punchy product title (5-10 words max)",
-  "category": "Main product category (e.g., Clothing, Electronics, Footwear)",
-  "description": "2-3 sentence compelling product description highlighting key features, material, style, and use cases. Be specific and persuasive.",
+  "title": "Short punchy product title (5-10 words)",
+  "category": "Main product category",
+  "description": "Compelling product description",
   "bullet_points": ["Feature 1", "Feature 2", "Feature 3", "Feature 4"],
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
-  "color": "Primary color(s) of the product",
+  "color": "Primary color(s)",
   "condition": "New",
-  "recommended_price_usd": 29.99,
-  "price_range_low": 19.99,
-  "price_range_high": 44.99,
-  "price_rationale": "1 sentence explaining why this price is fair for this type of product",
-  "seo_title": "SEO-optimized title with keywords",
-  "target_audience": "Who this product is best for"
+  "recommended_price": 0,
+  "price_range_low": 0,
+  "price_range_high": 0,
+  "price_rationale": "Reason for pricing",
+  "seo_title": "SEO title",
+  "target_audience": "Target audience"
 }
 
-Be realistic with pricing. Base prices on typical market rates for the product type.
-Respond with ONLY the JSON object — no extra text.
+Return ONLY JSON.
+"""
+def get_prompt(market):
+    if market == "PKR (₨)":
+        return BASE_PROMPT + """
+
+Price the product for Pakistan.
+
+Assume local wholesale/import pricing.
+
+Use realistic Pakistani market prices.
+
+Return ALL prices in PKR.
+
+Focus on competitive dealer pricing.
 """
 
+    elif market == "EUR (€)":
+        return BASE_PROMPT + """
 
-def analyze_product(model, image: Image.Image) -> dict:
-    """Send image to Gemini and parse the JSON response."""
-    response = model.generate_content([SYSTEM_PROMPT, image])
-    raw = response.text.strip()
+Price the product for Europe.
 
-    # Strip markdown fences if present
+Use realistic European market prices.
+
+Return ALL prices in EUR.
+"""
+
+    else:
+        return BASE_PROMPT + """
+
+Price the product for the United States.
+
+Use realistic wholesale dealer pricing.
+
+Return ALL prices in USD.
+"""
+
+def analyze_product(client: InferenceClient, image: Image.Image, market: str) -> dict:
+    """Send image to HuggingFace and parse the JSON response."""
+    img_url = image_to_base64(image)
+
+    response = client.chat_completion(
+        model=HF_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": img_url}},
+                    {"type": "text", "text": get_prompt(market)},
+                ],
+            }
+        ],
+        max_tokens=1000,
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    # Strip markdown fences if the model added them anyway
     raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"```$",          "", raw, flags=re.MULTILINE)
     raw = raw.strip()
 
     return json.loads(raw)
 
 
-def format_price(val) -> str:
-    try:
-        return f"${float(val):,.2f}"
-    except Exception:
-        return str(val)
-
-
 # ─── Sidebar ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-input[type="password"]::-ms-reveal,
-input[type="password"]::-ms-clear {
-    display: none;
-}
-
-[data-testid="stTextInput"] button {
-    display: none;
-}
-</style>
-""", unsafe_allow_html=True)
 with st.sidebar:
-    st.markdown("## Configuration")
+    st.markdown("## ⚙️ Configuration")
     api_key = st.text_input(
-        "Google Gemini API Key",
+        "HuggingFace API Token",
         type="password",
-        placeholder="AIza... or AQ...",
-        help="Get your free key at https://aistudio.google.com — both AIza and AQ key formats are valid.",
+        placeholder="hf_...",
+        help="Get your free token at https://huggingface.co/settings/tokens",
     )
     st.markdown("---")
-    st.markdown("### Currency")
-    currency = st.selectbox("Display prices in", ["USD ($)", "EUR (€)", "GBP (£)", "PKR (₨)", "INR (₹)"])
-    currency_map = {"USD ($)": ("$", 1), "EUR (€)": ("€", 0.92), "GBP (£)": ("£", 0.79), "PKR (₨)": ("₨", 278), "INR (₹)": ("₹", 83)}
-    sym, rate = currency_map[currency]
+    st.markdown("### 🌐 Currency")
+    currency = st.selectbox(
+    "Target Market",
+    ["USD ($)", "EUR (€)", "PKR (₨)"]
+    )
+    currency_symbols = {
+    "USD ($)": "$",
+    "EUR (€)": "€",
+    "PKR (₨)": "₨"
+    }
+    sym = currency_symbols[currency]
 
     st.markdown("---")
-    st.markdown("### About This App")
+    st.markdown("### 📋 About This App")
     st.markdown("""
 <div class='sidebar-info'>
-<b>ShopVision AI</b> uses Google's Gemini 1.5 Flash multimodal model to analyze product photos and instantly generate:
+<b>ShopVision AI</b> uses Qwen2.5-VL-7B (via HuggingFace) to analyze product photos and instantly generate:
 <br><br>
 Product titles & descriptions<br>
 SEO keywords & tags<br>
 Recommended pricing<br>
 Target audience insights<br>
 <br>
-<b>Powered by:</b> Gemini 1.5 Flash<br>
-<b>Free tier:</b> 15 req/min, 1500/day
+<b>Model:</b> Qwen2.5-VL-7B-Instruct<br>
+<b>Provider:</b> HuggingFace Free Tier<br>
+<b>No quota issues</b>
 </div>
 """, unsafe_allow_html=True)
 
 # ─── Hero Banner ─────────────────────────────────────────────────────────────
 st.markdown("""
 <div class='hero-banner'>
-    <h1>Product Caption Generator</h1>
+    <h1>I2C for E-commerce</h1>
     <p>Upload a product photo → Get instant titles, descriptions & pricing powered by AI</p>
 </div>
 """, unsafe_allow_html=True)
@@ -261,7 +320,6 @@ with col_upload:
         image = Image.open(uploaded_file)
         st.image(image, use_container_width=True, caption="Your product")
 
-        # File info
         size_kb = uploaded_file.size / 1024
         st.markdown(f"""
 <div class='metric-row'>
@@ -271,20 +329,23 @@ with col_upload:
 </div>
 """, unsafe_allow_html=True)
 
-        if st.button("🚀 Generate Listing"):
+        if st.button("Generate Listing"):
             if not api_key:
-                st.error("Please enter your Gemini API key in the sidebar.")
+                st.error("Please enter your HuggingFace API token in the sidebar.")
             else:
-                with st.spinner("🔍 Analyzing your product..."):
+                with st.spinner("Analyzing your product with Qwen2.5-VL..."):
                     try:
-                        model = configure_gemini(api_key)
-                        data = analyze_product(model, image)
+                        client = get_hf_client(api_key)
+                        data = analyze_product(
+                                client,
+                                image,
+                                currency)
                         st.session_state["result"] = data
+                        st.session_state["sym"]    = sym
                         st.session_state["sym"] = sym
-                        st.session_state["rate"] = rate
                         st.success("Analysis complete!")
                     except json.JSONDecodeError as e:
-                        st.error(f"JSON parse error: {e}")
+                        st.error(f"Could not parse model response as JSON: {e}")
                     except Exception as e:
                         st.error(f"Error: {e}")
     else:
@@ -301,35 +362,30 @@ with col_results:
     if "result" in st.session_state:
         d = st.session_state["result"]
         s = st.session_state["sym"]
-        r = st.session_state["rate"]
 
-        def px(v): return f"{s}{float(v)*r:,.2f}"
+        def px(v):return f"{s}{float(v):,.0f}"
 
-        st.markdown("### 🎯 Generated Listing")
-        st.markdown(f"<span class='badge'> {d.get('category','Product')}</span>", unsafe_allow_html=True)
+        st.markdown("### Generated Listing")
+        st.markdown(f"<span class='badge'>📂 {d.get('category','Product')}</span>", unsafe_allow_html=True)
 
-        # Title
         st.markdown(f"""
 <div class='result-card'>
     <h3>Product Title</h3>
     <p style='font-size:1.25rem; font-weight:600;'>{d.get('title','')}</p>
 </div>""", unsafe_allow_html=True)
 
-        # SEO Title
         st.markdown(f"""
 <div class='result-card'>
     <h3>SEO Title</h3>
     <p>{d.get('seo_title','')}</p>
 </div>""", unsafe_allow_html=True)
 
-        # Description
         st.markdown(f"""
 <div class='result-card'>
     <h3>Product Description</h3>
     <p>{d.get('description','')}</p>
 </div>""", unsafe_allow_html=True)
 
-        # Bullet points
         bullets_html = "".join([f"<li style='margin:4px 0'>{b}</li>" for b in d.get("bullet_points", [])])
         st.markdown(f"""
 <div class='result-card'>
@@ -337,18 +393,16 @@ with col_results:
     <ul style='margin:0; padding-left:1.2rem; color:#1a1a2e;'>{bullets_html}</ul>
 </div>""", unsafe_allow_html=True)
 
-        # Price card
         st.markdown(f"""
 <div class='price-card'>
     <div class='price-label'>💰 Recommended Price</div>
-    <div class='price-value'>{px(d.get('recommended_price_usd', 0))}</div>
+    <div class='price-value'>{px(d.get("recommended_price", 0))}</div>
     <div class='price-range'>Market Range: {px(d.get('price_range_low', 0))} – {px(d.get('price_range_high', 0))}</div>
     <div style='margin-top:0.7rem; font-size:0.85rem; opacity:0.85;'>💡 {d.get('price_rationale','')}</div>
 </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Tags + details
         col_a, col_b = st.columns(2)
         with col_a:
             tags_html = "".join([f"<span class='tag-pill'>{t}</span>" for t in d.get("tags", [])])
@@ -367,7 +421,6 @@ with col_results:
     <b>Audience:</b> {d.get('target_audience','—')}</p>
 </div>""", unsafe_allow_html=True)
 
-        # Export JSON
         st.markdown("---")
         json_str = json.dumps(d, indent=2)
         st.download_button(
@@ -391,6 +444,6 @@ with col_results:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center; color:#9ca3af; font-size:0.82rem; padding:0.5rem 0 1rem;'>
-    ShopVision AI · Powered by Google Gemini 1.5 Flash · Built with Streamlit
+    ShopVision AI · Powered by Qwen2.5-VL-7B on HuggingFace · Built with Streamlit
 </div>
 """, unsafe_allow_html=True)
